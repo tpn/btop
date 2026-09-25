@@ -10,6 +10,32 @@ if("${CMAKE_CURRENT_SOURCE_DIR}" STREQUAL "${CMAKE_CURRENT_BINARY_DIR}")
   message(FATAL_ERROR "In-source builds are not allowed")
 endif()
 
+# Allow builds to proceed when environments export ccache launchers globally but
+# ccache itself is not installed.
+find_program(BTOP_CCACHE_EXECUTABLE ccache)
+if(NOT BTOP_CCACHE_EXECUTABLE)
+  set(_BTOP_DISABLED_CCACHE FALSE)
+
+  foreach(_launcher_var IN ITEMS
+    CMAKE_C_COMPILER_LAUNCHER
+    CMAKE_C_LINKER_LAUNCHER
+    CMAKE_CXX_COMPILER_LAUNCHER
+    CMAKE_CXX_LINKER_LAUNCHER
+  )
+    if("${${_launcher_var}}" STREQUAL "ccache" OR "$ENV{${_launcher_var}}" STREQUAL "ccache")
+      set(${_launcher_var} "" CACHE STRING "${_launcher_var}" FORCE)
+      set(ENV{${_launcher_var}} "")
+      set(_BTOP_DISABLED_CCACHE TRUE)
+    endif()
+  endforeach()
+  unset(_launcher_var)
+
+  if(_BTOP_DISABLED_CCACHE)
+    message(STATUS "ccache launcher requested but ccache was not found; disabling compiler/linker launchers")
+  endif()
+endif()
+unset(_BTOP_DISABLED_CCACHE)
+
 project("btop"
   DESCRIPTION "A monitor of resources"
   HOMEPAGE_URL "https://github.com/aristocratos/btop"
@@ -121,10 +147,6 @@ endif()
 check_cxx_symbol_exists("__cpp_lib_ranges" "version" HAS_CXX_RANGES)
 if(NOT HAS_CXX_RANGES)
   message(FATAL_ERROR "The compiler doesn't support std::ranges")
-endif()
-check_cxx_symbol_exists("__cpp_lib_ranges_to_container" "version" HAS_CXX_RANGES_TO_CONTAINER)
-if(NOT HAS_CXX_RANGES_TO_CONTAINER)
-  message(FATAL_ERROR "The compiler doesn't support std::ranges::to")
 endif()
 check_cxx_symbol_exists("__cpp_lib_string_contains" "version" HAS_CXX_STRING_CONTAINS)
 if(NOT HAS_CXX_STRING_CONTAINS)

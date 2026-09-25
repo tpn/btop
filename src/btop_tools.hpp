@@ -291,9 +291,14 @@ namespace Tools {
 	}
 
 	//* Split <string> at all occurrences of <delim> and return as vector of strings
-	constexpr auto ssplit(std::string_view str, char delim = ' ') {
-		return str | std::views::split(delim) | std::views::filter([](auto&& range) { return !std::ranges::empty(range); }) |
-			   std::ranges::to<std::vector<std::string>>();
+	inline auto ssplit(std::string_view str, char delim = ' ') {
+		std::vector<std::string> parts;
+		for (auto&& range : str | std::views::split(delim)) {
+			if (std::ranges::empty(range)) continue;
+			parts.emplace_back(range.begin(), range.end());
+		}
+
+		return parts;
 	}
 
 	//* Put current thread to sleep for <ms> milliseconds
