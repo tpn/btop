@@ -785,12 +785,21 @@ namespace Menu {
 				"whichever currently has the highest scale.",
 				"",
 				"True or False."},
+			{"net_iface_sync",
+				"Network interface scale sync.",
+				"",
+				"Syncs graph scaling across every interface",
+				"listed in the Network Interface setting.",
+				"",
+				"True or False."},
 			{"net_iface",
-				"Network Interface.",
+				"Network Interface(s).",
 				"",
-				"Manually set the starting Network Interface.",
+				"Set one interface for the classic view, or",
+				"an ordered whitespace-separated list for",
+				"equal multi-interface panels.",
 				"",
-				"Will otherwise automatically choose the NIC",
+				"With no value, automatically chooses the NIC",
 				"with the highest total download since boot."},
 		    {"base_10_bitrate",
 			    "Base 10 bitrate",
@@ -1386,7 +1395,11 @@ static int optionsMenu(const string& key) {
 				const auto& option = categories[selected_cat][item_height * page + selected][0];
 				if (selPred.test(isString) and Config::stringValid(option, editor.text)) {
 					Config::set(option, editor.text);
-					if (option == "custom_cpu_name" or option.starts_with("custom_gpu_name"))
+					if (option == "net_iface") {
+						screen_redraw = true;
+						atomic_wait(Runner::active);
+					}
+					else if (option == "custom_cpu_name" or option.starts_with("custom_gpu_name"))
 						screen_redraw = true;
 					else if (is_in(option, "shown_boxes", "presets")) {
 						screen_redraw = true;

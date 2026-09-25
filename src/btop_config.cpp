@@ -240,7 +240,10 @@ namespace Config {
 
 		{"net_sync", 			"#* Sync the auto scaling for download and upload to whichever currently has the highest scale."},
 
-		{"net_iface", 			"#* Starts with the Network Interface specified here."},
+		{"net_iface_sync",		"#* Sync the graph scaling across all interfaces listed in net_iface."},
+
+		{"net_iface", 			"#* Network interface or ordered whitespace-separated list of interfaces to show.\n"
+								"#* A single interface keeps the classic view; two or more interfaces enable equal multi-interface panels."},
 
 	    {"base_10_bitrate",     "#* \"True\" shows bitrates in base 10 (Kbps, Mbps). \"False\" shows bitrates in binary sizes (Kibps, Mibps, etc.). \"Auto\" uses base_10_sizes."},
 
@@ -353,6 +356,7 @@ namespace Config {
 		{"io_graph_combined", false},
 		{"net_auto", true},
 		{"net_sync", true},
+		{"net_iface_sync", false},
 		{"show_battery", true},
 		{"show_battery_watts", true},
 		{"vim_keys", false},

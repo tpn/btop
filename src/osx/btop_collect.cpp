@@ -1453,7 +1453,8 @@ namespace Net {
 		// Lock mutex to prevent concurrent interface access during USB device changes
 		std::lock_guard<std::mutex> lock(Mem::interface_mutex);
 		auto &net = current_net;
-		auto &config_iface = Config::getS("net_iface");
+		const auto configured_ifaces = configured_interfaces();
+		const auto config_iface = configured_ifaces.empty() ? string{} : configured_ifaces.front();
 		auto net_sync = Config::getB("net_sync");
 		auto net_auto = Config::getB("net_auto");
 		auto new_timestamp = time_ms();

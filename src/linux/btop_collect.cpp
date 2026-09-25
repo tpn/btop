@@ -19,6 +19,7 @@ tab-size = 4
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -35,8 +36,12 @@ tab-size = 4
 #include <arpa/inet.h> // for inet_ntop()
 #include <dlfcn.h>
 #include <ifaddrs.h>
+#include <linux/ethtool.h>
+#include <linux/sockios.h>
 #include <net/if.h>
 #include <netdb.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
 
@@ -2886,6 +2891,259 @@ namespace Mem {
 }
 
 namespace Net {
+	namespace {
+		constexpr uint64_t slow_health_interval_ms = 10'000;
+
+		struct slow_net_snapshot {
+			string iface;
+			string pci_address;
+			string physical_id;
+			string physical_port;
+			string rdma_device;
+			string rdma_state;
+			string rdma_physical_state;
+			string rdma_rate;
+			uint64_t roce_out_of_buffer{};
+			uint64_t roce_retrans{};
+			uint64_t roce_ecn_marked{};
+			uint64_t roce_cnp{};
+			uint64_t roce_icrc_errors{};
+			uint64_t roce_rx_write_requests{};
+			net_phy_health phy_health{};
+		};
+
+		uint64_t read_u64(const fs::path& path) {
+			const auto value = readfile(path, "0");
+			uint64_t parsed{};
+			const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+			return result.ec == std::errc{} ? parsed : 0;
+		}
+
+		string pci_address(const string& iface) {
+			std::error_code ec;
+			const auto device = fs::canonical(fs::path{"/sys/class/net"} / iface / "device", ec);
+			return ec ? "" : device.filename();
+		}
+
+		string first_directory_name(const fs::path& path) {
+			std::error_code ec;
+			const auto end = fs::directory_iterator{};
+			for (auto it = fs::directory_iterator(path, ec); not ec and it != end; it.increment(ec)) {
+				if (it->is_directory(ec) or it->is_symlink(ec)) return it->path().filename();
+			}
+			return "";
+		}
+
+		string state_name(string value) {
+			if (const auto separator = value.find(": "); separator != string::npos) value.erase(0, separator + 2);
+			return value;
+		}
+
+		string fec_name(const uint32_t fec) {
+			#ifdef ETHTOOL_FEC_LLRS
+			if ((fec & ETHTOOL_FEC_LLRS) != 0) return "LLRS";
+			#endif
+			#ifdef ETHTOOL_FEC_RS
+			if ((fec & ETHTOOL_FEC_RS) != 0) return "RS";
+			#endif
+			#ifdef ETHTOOL_FEC_BASER
+			if ((fec & ETHTOOL_FEC_BASER) != 0) return "Base-R";
+			#endif
+			#ifdef ETHTOOL_FEC_OFF
+			if ((fec & ETHTOOL_FEC_OFF) != 0) return "Off";
+			#endif
+			#ifdef ETHTOOL_FEC_AUTO
+			if ((fec & ETHTOOL_FEC_AUTO) != 0) return "Auto";
+			#endif
+			return fec == 0 ? "" : to_string(fec);
+		}
+
+		void collect_ethtool_health(slow_net_snapshot& snapshot) {
+			const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+			if (fd < 0) return;
+
+			struct ifreq request {};
+			std::strncpy(request.ifr_name, snapshot.iface.c_str(), IFNAMSIZ - 1);
+			auto run = [&](void* data) {
+				request.ifr_data = static_cast<char*>(data);
+				return ioctl(fd, SIOCETHTOOL, &request) == 0;
+			};
+
+			struct ethtool_drvinfo driver {};
+			driver.cmd = ETHTOOL_GDRVINFO;
+			if (run(&driver)) {
+				snapshot.phy_health.firmware = driver.fw_version;
+				if (driver.n_stats > 0) {
+					vector<unsigned char> strings_buffer(
+						sizeof(struct ethtool_gstrings) + driver.n_stats * ETH_GSTRING_LEN
+					);
+					auto* strings = reinterpret_cast<struct ethtool_gstrings*>(strings_buffer.data());
+					strings->cmd = ETHTOOL_GSTRINGS;
+					strings->string_set = ETH_SS_STATS;
+					strings->len = driver.n_stats;
+
+					vector<unsigned char> stats_buffer(
+						sizeof(struct ethtool_stats) + driver.n_stats * sizeof(uint64_t)
+					);
+					auto* stats = reinterpret_cast<struct ethtool_stats*>(stats_buffer.data());
+					stats->cmd = ETHTOOL_GSTATS;
+					stats->n_stats = driver.n_stats;
+
+					if (run(strings) and run(stats)) {
+						for (uint32_t i = 0; i < driver.n_stats; ++i) {
+							const auto* raw_name = reinterpret_cast<const char*>(strings->data + i * ETH_GSTRING_LEN);
+							const string name{raw_name, strnlen(raw_name, ETH_GSTRING_LEN)};
+							const auto value = stats->data[i];
+
+							if (name == "rx_corrected_bits_phy" or name == "phy_corrected_bits")
+								snapshot.phy_health.corrected_bits = value;
+							else if (name == "rx_crc_errors_phy")
+								snapshot.phy_health.crc_errors = value;
+							else if (name == "rx_pcs_symbol_err_phy" or name == "rx_symbol_err_phy")
+								snapshot.phy_health.symbol_errors += value;
+							else if (name == "link_down_events_phy")
+								snapshot.phy_health.link_down_events = value;
+							else if (name == "rx_global_pause")
+								snapshot.phy_health.rx_pause = value;
+							else if (name == "tx_global_pause")
+								snapshot.phy_health.tx_pause = value;
+						}
+					}
+				}
+			}
+
+			#ifdef ETHTOOL_GFECPARAM
+			struct ethtool_fecparam fec {};
+			fec.cmd = ETHTOOL_GFECPARAM;
+			if (run(&fec)) snapshot.phy_health.fec_mode = fec_name(fec.active_fec);
+			#endif
+
+			close(fd);
+		}
+
+		slow_net_snapshot collect_slow_health(const string& iface) {
+			slow_net_snapshot snapshot;
+			snapshot.iface = iface;
+			const fs::path net_path = fs::path{"/sys/class/net"} / iface;
+			snapshot.pci_address = pci_address(iface);
+			snapshot.physical_port = readfile(net_path / "phys_port_name");
+			snapshot.physical_id = physical_interface_id(
+				readfile(net_path / "phys_switch_id"),
+				snapshot.physical_port,
+				snapshot.pci_address,
+				iface
+			);
+			snapshot.rdma_device = first_directory_name(net_path / "device/infiniband");
+
+			if (not snapshot.rdma_device.empty()) {
+				const fs::path rdma_port = fs::path{"/sys/class/infiniband"} / snapshot.rdma_device / "ports/1";
+				snapshot.rdma_state = state_name(readfile(rdma_port / "state"));
+				snapshot.rdma_physical_state = state_name(readfile(rdma_port / "phys_state"));
+				snapshot.rdma_rate = readfile(rdma_port / "rate");
+				snapshot.roce_out_of_buffer = read_u64(rdma_port / "hw_counters/out_of_buffer");
+				snapshot.roce_retrans =
+					read_u64(rdma_port / "hw_counters/roce_adp_retrans") +
+					read_u64(rdma_port / "hw_counters/roce_adp_retrans_to");
+				snapshot.roce_ecn_marked = read_u64(rdma_port / "hw_counters/np_ecn_marked_roce_packets");
+				snapshot.roce_cnp =
+					read_u64(rdma_port / "hw_counters/np_cnp_sent") +
+					read_u64(rdma_port / "hw_counters/rp_cnp_handled");
+				snapshot.roce_icrc_errors = read_u64(rdma_port / "hw_counters/rx_icrc_encapsulated");
+				snapshot.roce_rx_write_requests = read_u64(rdma_port / "hw_counters/rx_write_requests");
+			}
+
+			collect_ethtool_health(snapshot);
+			snapshot.phy_health.updated_ms = time_ms();
+			return snapshot;
+		}
+
+		void collect_fast_details(net_info& info, const string& iface) {
+			const fs::path net_path = fs::path{"/sys/class/net"} / iface;
+			info.mac_address = readfile(net_path / "address");
+			info.operstate = readfile(net_path / "operstate", info.connected ? "up" : "down");
+			info.carrier = readfile(net_path / "carrier", "0") == "1";
+			info.mtu = read_u64(net_path / "mtu");
+			info.link_speed_mbps = read_u64(net_path / "speed");
+			info.rx_errors = read_u64(net_path / "statistics/rx_errors");
+			info.rx_dropped = read_u64(net_path / "statistics/rx_dropped");
+			info.tx_errors = read_u64(net_path / "statistics/tx_errors");
+			info.tx_dropped = read_u64(net_path / "statistics/tx_dropped");
+
+			if (info.pci_address.empty()) info.pci_address = pci_address(iface);
+			if (info.physical_port.empty()) info.physical_port = readfile(net_path / "phys_port_name");
+			info.physical_id = physical_interface_id(
+				readfile(net_path / "phys_switch_id"),
+				info.physical_port,
+				info.pci_address,
+				iface
+			);
+		}
+
+		void apply_slow_snapshot(net_info& info, slow_net_snapshot snapshot) {
+			auto& previous = info.phy_health;
+			if (
+				previous.updated_ms > 0 and
+				snapshot.phy_health.updated_ms > previous.updated_ms and
+				snapshot.phy_health.corrected_bits >= previous.corrected_bits
+			) {
+				snapshot.phy_health.corrected_bits_per_second =
+					(snapshot.phy_health.corrected_bits - previous.corrected_bits) * 1000 /
+					(snapshot.phy_health.updated_ms - previous.updated_ms);
+			}
+
+			info.pci_address = std::move(snapshot.pci_address);
+			info.physical_id = std::move(snapshot.physical_id);
+			info.physical_port = std::move(snapshot.physical_port);
+			info.rdma_device = std::move(snapshot.rdma_device);
+			info.rdma_state = std::move(snapshot.rdma_state);
+			info.rdma_physical_state = std::move(snapshot.rdma_physical_state);
+			info.rdma_rate = std::move(snapshot.rdma_rate);
+			info.roce_out_of_buffer = snapshot.roce_out_of_buffer;
+			info.roce_retrans = snapshot.roce_retrans;
+			info.roce_ecn_marked = snapshot.roce_ecn_marked;
+			info.roce_cnp = snapshot.roce_cnp;
+			info.roce_icrc_errors = snapshot.roce_icrc_errors;
+			info.roce_rx_write_requests = snapshot.roce_rx_write_requests;
+			info.phy_health = std::move(snapshot.phy_health);
+		}
+
+		void update_slow_health(
+			std::unordered_map<string, net_info>& net,
+			const vector<string>& requested_ifaces,
+			const uint64_t now
+		) {
+			static future<vector<slow_net_snapshot>> health_future;
+			static bool health_running = false;
+			static uint64_t health_started = 0;
+
+			if (health_running and health_future.wait_for(0s) == std::future_status::ready) {
+				for (auto& snapshot : health_future.get()) {
+					if (net.contains(snapshot.iface)) apply_slow_snapshot(net.at(snapshot.iface), std::move(snapshot));
+				}
+				health_running = false;
+				redraw = true;
+			}
+
+			if (health_running or (health_started > 0 and now - health_started < slow_health_interval_ms))
+				return;
+
+			vector<string> available;
+			for (const auto& iface : requested_ifaces) {
+				if (net.contains(iface) and not v_contains(available, iface)) available.push_back(iface);
+			}
+			if (available.empty()) return;
+
+			health_started = now;
+			health_running = true;
+			health_future = async(std::launch::async, [ifaces = std::move(available)] {
+				vector<slow_net_snapshot> snapshots;
+				snapshots.reserve(ifaces.size());
+				for (const auto& iface : ifaces) snapshots.push_back(collect_slow_health(iface));
+				return snapshots;
+			});
+		}
+	}
+
 	std::unordered_map<string, net_info> current_net;
 	net_info empty_net = {};
 	vector<string> interfaces;
@@ -2899,7 +3157,8 @@ namespace Net {
 	auto collect(bool no_update) -> net_info& {
 		if (Runner::stopping) return empty_net;
 		auto& net = current_net;
-		auto& config_iface = Config::getS("net_iface");
+		const auto configured_ifaces = configured_interfaces();
+		const auto config_iface = configured_ifaces.empty() ? string{} : configured_ifaces.front();
 		auto net_sync = Config::getB("net_sync");
 		auto net_auto = Config::getB("net_auto");
 		auto new_timestamp = time_ms();
@@ -3058,6 +3317,13 @@ namespace Net {
 
 			}
 		}
+
+		auto detail_ifaces = configured_ifaces;
+		if (detail_ifaces.empty() and not selected_iface.empty()) detail_ifaces.push_back(selected_iface);
+		for (const auto& iface : detail_ifaces) {
+			if (net.contains(iface)) collect_fast_details(net.at(iface), iface);
+		}
+		if (not no_update) update_slow_health(net, detail_ifaces, new_timestamp);
 
 		//? Calculate max scale for graphs if needed
 		if (net_auto) {

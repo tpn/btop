@@ -16,6 +16,7 @@ indent = tab
 tab-size = 4
 */
 
+#include <algorithm>
 #include <sys/resource.h>
 #include <filesystem>
 #include <fstream>
@@ -92,6 +93,60 @@ namespace Gpu {
 	long long gpu_pwr_total_max = 0;
 }
 #endif
+
+namespace Net {
+	vector<string> parse_interface_list(const std::string_view value) {
+		vector<string> parsed;
+		for (auto& iface : ssplit(value)) {
+			if (not v_contains(parsed, iface)) parsed.push_back(std::move(iface));
+		}
+		return parsed;
+	}
+
+	vector<string> configured_interfaces() {
+		return parse_interface_list(Config::getS("net_iface"));
+	}
+
+	vector<string> displayed_interfaces() {
+		auto configured = configured_interfaces();
+		if (configured.size() > 1) return configured;
+		if (not selected_iface.empty()) return {selected_iface};
+		return configured;
+	}
+
+	void synchronize_graph_scales(
+		vector<net_graph_scale>& scales,
+		const bool sync_directions,
+		const bool sync_interfaces
+	) {
+		if (sync_directions) {
+			for (auto& scale : scales) scale.download = scale.upload = std::max(scale.download, scale.upload);
+		}
+		if (sync_interfaces and not scales.empty()) {
+			uint64_t download = 0;
+			uint64_t upload = 0;
+			for (const auto& scale : scales) {
+				download = std::max(download, scale.download);
+				upload = std::max(upload, scale.upload);
+			}
+			for (auto& scale : scales) {
+				scale.download = download;
+				scale.upload = upload;
+			}
+		}
+	}
+
+	string physical_interface_id(
+		const std::string_view switch_id,
+		const std::string_view port_name,
+		const std::string_view pci_address,
+		const std::string_view iface
+	) {
+		if (not switch_id.empty() and not port_name.empty()) return string{switch_id} + ':' + string{port_name};
+		if (not pci_address.empty()) return string{pci_address};
+		return string{iface};
+	}
+}
 
 namespace Proc {
 bool set_priority(pid_t pid, int priority) {

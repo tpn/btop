@@ -327,13 +327,74 @@ namespace Net {
 		uint64_t rollover{};
 	};
 
+	struct net_phy_health {
+		string fec_mode{};
+		string firmware{};
+		uint64_t corrected_bits{};
+		uint64_t corrected_bits_per_second{};
+		uint64_t crc_errors{};
+		uint64_t symbol_errors{};
+		uint64_t link_down_events{};
+		uint64_t rx_pause{};
+		uint64_t tx_pause{};
+		uint64_t updated_ms{};
+	};
+
+	struct net_graph_scale {
+		uint64_t download{};
+		uint64_t upload{};
+	};
+
 	struct net_info {
 		std::unordered_map<string, deque<long long>> bandwidth = { {"download", {}}, {"upload", {}} };
 		std::unordered_map<string, net_stat> stat = { {"download", {}}, {"upload", {}} };
 		string ipv4{};      // defaults to ""
 		string ipv6{};      // defaults to ""
+		string mac_address{};
+		string operstate{};
+		string pci_address{};
+		string physical_id{};
+		string physical_port{};
+		string rdma_device{};
+		string rdma_state{};
+		string rdma_physical_state{};
+		string rdma_rate{};
+		uint64_t link_speed_mbps{};
+		uint64_t mtu{};
+		uint64_t rx_errors{};
+		uint64_t rx_dropped{};
+		uint64_t tx_errors{};
+		uint64_t tx_dropped{};
+		uint64_t roce_out_of_buffer{};
+		uint64_t roce_retrans{};
+		uint64_t roce_ecn_marked{};
+		uint64_t roce_cnp{};
+		uint64_t roce_icrc_errors{};
+		uint64_t roce_rx_write_requests{};
+		net_phy_health phy_health{};
+		bool carrier{};
 		bool connected{};
 	};
+
+	//* Parse a whitespace-separated interface list, preserving order and removing duplicates.
+	vector<string> parse_interface_list(std::string_view value);
+
+	//* Return the configured interface list from net_iface.
+	vector<string> configured_interfaces();
+
+	//* Return the interfaces currently requested for display, or the selected legacy interface.
+	vector<string> displayed_interfaces();
+
+	//* Apply optional direction and cross-interface scale synchronization in place.
+	void synchronize_graph_scales(vector<net_graph_scale>& scales, bool sync_directions, bool sync_interfaces);
+
+	//* Build a stable physical-port key, falling back to the PCI address or interface name.
+	string physical_interface_id(
+		std::string_view switch_id,
+		std::string_view port_name,
+		std::string_view pci_address,
+		std::string_view iface
+	);
 
 	class IfAddrsPtr {
 		struct ifaddrs* ifaddr;

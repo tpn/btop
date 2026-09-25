@@ -596,8 +596,9 @@ namespace Input {
 				bool keep_going = false;
 				bool no_update = true;
 				bool redraw = true;
+				const auto displayed_ifaces = Net::displayed_interfaces();
 
-				if (is_in(key, "b", "n")) {
+				if (is_in(key, "b", "n") and displayed_ifaces.size() <= 1) {
 					atomic_wait(Runner::active);
 					int c_index = v_index(Net::interfaces, Net::selected_iface);
 					if (c_index != (int)Net::interfaces.size()) {
@@ -615,20 +616,35 @@ namespace Input {
 					Config::flip("net_sync");
 					Net::rescale = true;
 				}
+				else if (key == "v" and displayed_ifaces.size() > 1) {
+					Config::flip("net_iface_sync");
+					Net::rescale = true;
+				}
 				else if (key == "a") {
 					Config::flip("net_auto");
 					Net::rescale = true;
 				}
 				else if (key == "z") {
 					atomic_wait(Runner::active);
-					auto& ndev = Net::current_net.at(Net::selected_iface);
-					if (ndev.stat.at("download").offset + ndev.stat.at("upload").offset > 0) {
-						ndev.stat.at("download").offset = 0;
-						ndev.stat.at("upload").offset = 0;
+					bool has_offset = false;
+					for (const auto& iface : displayed_ifaces) {
+						if (not Net::current_net.contains(iface)) continue;
+						const auto& ndev = Net::current_net.at(iface);
+						has_offset |= ndev.stat.at("download").offset + ndev.stat.at("upload").offset > 0;
 					}
-					else {
-						ndev.stat.at("download").offset = ndev.stat.at("download").last + ndev.stat.at("download").rollover;
-						ndev.stat.at("upload").offset = ndev.stat.at("upload").last + ndev.stat.at("upload").rollover;
+					for (const auto& iface : displayed_ifaces) {
+						if (not Net::current_net.contains(iface)) continue;
+						auto& ndev = Net::current_net.at(iface);
+						if (has_offset) {
+							ndev.stat.at("download").offset = 0;
+							ndev.stat.at("upload").offset = 0;
+						}
+						else {
+							ndev.stat.at("download").offset =
+								ndev.stat.at("download").last + ndev.stat.at("download").rollover;
+							ndev.stat.at("upload").offset =
+								ndev.stat.at("upload").last + ndev.stat.at("upload").rollover;
+						}
 					}
 					no_update = false;
 				}

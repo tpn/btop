@@ -20,6 +20,7 @@ tab-size = 4
 #include <array>
 #include <cmath>
 #include <iterator>
+#include <numeric>
 #include <ranges>
 #include <stdexcept>
 #include <string>
@@ -1496,7 +1497,7 @@ namespace Net {
 	std::unordered_map<string, Draw::Graph> graphs;
 	string box;
 
-	string draw(const net_info& net, bool force_redraw, bool data_same) {
+	string draw_single(const net_info& net, bool force_redraw, bool data_same) {
 		if (Runner::stopping) return "";
 		if (force_redraw) redraw = true;
 		auto net_sync = Config::getB("net_sync");
@@ -1520,6 +1521,11 @@ namespace Net {
 		//* Redraw elements not needed to be updated every cycle
 		if (redraw) {
 			out = box;
+			out += Draw::createBox(
+				b_x, b_y, b_width, b_height, "", false,
+				swap_upload_download ? "upload" : "download",
+				swap_upload_download ? "download" : "upload"
+			);
 			//? Graphs
 			graphs.clear();
 			if (safeVal(net.bandwidth, "download"s).empty() or safeVal(net.bandwidth, "upload"s).empty())
@@ -1596,6 +1602,336 @@ namespace Net {
 
 		redraw = false;
 		return out + Fx::reset;
+	}
+
+	struct iface_scale {
+		std::unordered_map<string, uint64_t> maximum = {{"download", 0}, {"upload", 0}};
+		std::unordered_map<string, array<int, 2>> count = {{"download", {}}, {"upload", {}}};
+	};
+
+	struct panel_geometry {
+		int x;
+		int y;
+		int width;
+		int height;
+	};
+
+	std::unordered_map<string, iface_scale> iface_scales;
+
+	string link_speed(const uint64_t speed_mbps) {
+		if (speed_mbps == 0) return "?";
+		if (speed_mbps >= 1000 and speed_mbps % 1000 == 0) return to_string(speed_mbps / 1000) + "G";
+		if (speed_mbps >= 1000) return fmt::format("{:.1f}G", static_cast<double>(speed_mbps) / 1000.0);
+		return to_string(speed_mbps) + "M";
+	}
+
+	bool update_iface_scales(
+		const vector<string>& ifaces,
+		const bool force,
+		const bool net_auto,
+		const bool net_sync,
+		const bool iface_sync
+	) {
+		if (not net_auto) return false;
+		bool changed = false;
+
+		for (const auto& iface : ifaces) {
+			if (not current_net.contains(iface)) continue;
+			auto& scale = iface_scales[iface];
+			const auto& info = current_net.at(iface);
+
+			for (const string dir : {"download", "upload"}) {
+				auto& maximum = scale.maximum[dir];
+				auto& count = scale.count[dir];
+				const auto speed = info.stat.at(dir).speed;
+				int direction = -1;
+
+				if (speed > maximum) {
+					++count[0];
+					if (count[1] > 0) --count[1];
+					direction = 0;
+				}
+				else if (maximum > (10 << 10) and speed < maximum / 10) {
+					++count[1];
+					if (count[0] > 0) --count[0];
+					direction = 1;
+				}
+
+				if (force or maximum == 0 or (direction >= 0 and count[direction] >= 5)) {
+					const auto& bandwidth = info.bandwidth.at(dir);
+					const auto samples = min<size_t>(5, bandwidth.size());
+					const auto average = samples == 0
+						? static_cast<long long>(speed)
+						: std::accumulate(bandwidth.rbegin(), bandwidth.rbegin() + samples, 0ll) /
+							static_cast<long long>(samples);
+					const auto multiplier = direction == 1 ? 3.0 : 1.3;
+					const auto next = max(
+						static_cast<uint64_t>(max(0ll, average) * multiplier),
+						static_cast<uint64_t>(10 << 10)
+					);
+					if (maximum != next) {
+						maximum = next;
+						changed = true;
+					}
+					count = {};
+				}
+			}
+		}
+
+		vector<net_graph_scale> scales;
+		scales.reserve(ifaces.size());
+		for (const auto& iface : ifaces)
+			scales.push_back({iface_scales[iface].maximum["download"], iface_scales[iface].maximum["upload"]});
+		synchronize_graph_scales(scales, net_sync, iface_sync);
+		for (size_t index = 0; index < ifaces.size(); ++index) {
+			auto& scale = iface_scales[ifaces[index]];
+			if (
+				scale.maximum["download"] != scales[index].download or
+				scale.maximum["upload"] != scales[index].upload
+			) changed = true;
+			scale.maximum["download"] = scales[index].download;
+			scale.maximum["upload"] = scales[index].upload;
+		}
+		return changed;
+	}
+
+	vector<panel_geometry> panel_layout(const size_t count, const int health_rows, string& out, const bool draw_lines) {
+		vector<panel_geometry> panels;
+		if (count == 0) return panels;
+
+		const int inner_x = x + 1;
+		const int inner_y = y + 1;
+		const int inner_width = max(1, width - 2);
+		const int health_separator = health_rows > 0 ? 1 : 0;
+		const int inner_height = max(1, height - 2 - health_rows - health_separator);
+		const bool columns = (inner_width - static_cast<int>(count) + 1) / static_cast<int>(count) >= 30;
+
+		if (columns) {
+			const int separators = static_cast<int>(count) - 1;
+			const int available = inner_width - separators;
+			int cursor = inner_x;
+			for (size_t index = 0; index < count; ++index) {
+				const int panel_width = available / static_cast<int>(count) +
+					(static_cast<int>(index) < available % static_cast<int>(count));
+				panels.push_back({cursor, inner_y, panel_width, inner_height});
+				cursor += panel_width;
+				if (index + 1 < count) {
+					if (draw_lines) {
+						for (int row = 0; row < inner_height; ++row)
+							out += Mv::to(inner_y + row, cursor) + Theme::c("div_line") + Symbols::v_line;
+					}
+					++cursor;
+				}
+			}
+		}
+		else {
+			const int separators = static_cast<int>(count) - 1;
+			const int available = max(1, inner_height - separators);
+			int cursor = inner_y;
+			for (size_t index = 0; index < count; ++index) {
+				const int panel_height = available / static_cast<int>(count) +
+					(static_cast<int>(index) < available % static_cast<int>(count));
+				panels.push_back({inner_x, cursor, inner_width, panel_height});
+				cursor += panel_height;
+				if (index + 1 < count) {
+					if (draw_lines)
+						out += Mv::to(cursor, inner_x) + Theme::c("div_line") + Symbols::h_line * inner_width;
+					++cursor;
+				}
+			}
+		}
+
+		if (health_rows > 0 and draw_lines) {
+			const int separator_y = y + height - health_rows - 1;
+			out += Mv::to(separator_y, x) + Theme::c("net_box") + Symbols::div_right +
+				Theme::c("div_line") + Symbols::h_line * (width - 2) +
+				Theme::c("net_box") + Symbols::div_left;
+		}
+		return panels;
+	}
+
+	void clear_line(string& out, const int row, const int column, const int line_width) {
+		out += Mv::to(row, column) + Theme::c("main_fg") + string(max(0, line_width), ' ');
+	}
+
+	void draw_panel(
+		string& out,
+		const string& iface,
+		const panel_geometry& panel,
+		const bool swap_upload_download,
+		const bool net_auto,
+		const string& graph_symbol,
+		const bool data_same
+	) {
+		clear_line(out, panel.y, panel.x, panel.width);
+		out += Mv::to(panel.y, panel.x) + Theme::c("hi_fg") + Fx::b +
+			uresize(iface, max(1, panel.width - 12)) + Fx::ub;
+
+		if (not current_net.contains(iface)) {
+			out += Mv::to(panel.y, panel.x + max(0, panel.width - 11)) + Theme::c("inactive_fg") + " unavailable";
+			return;
+		}
+
+		const auto& info = current_net.at(iface);
+		const string state = info.carrier ? "UP " + link_speed(info.link_speed_mbps) : "DOWN";
+		out += Mv::to(panel.y, panel.x + max(0, panel.width - static_cast<int>(state.size()))) +
+			(info.carrier ? Theme::g("available").at(100) : Theme::c("inactive_fg")) + state;
+
+		vector<string> metadata;
+		const string address = not info.ipv4.empty() ? info.ipv4 : info.ipv6;
+		metadata.push_back((address.empty() ? "no IP" : address) +
+			(panel.width >= 38 and not info.mac_address.empty() ? "  " + info.mac_address : ""));
+		if (panel.height >= 8) {
+			metadata.push_back(
+				"MTU " + to_string(info.mtu) +
+				(not info.pci_address.empty() ? "  PCI " + info.pci_address : "") +
+				fmt::format("  err/drop {}/{}", info.rx_errors + info.tx_errors, info.rx_dropped + info.tx_dropped)
+			);
+		}
+		if (panel.height >= 8 and not info.rdma_device.empty()) {
+			metadata.push_back(
+				"RoCE " + info.rdma_device + " " + (info.rdma_state.empty() ? "?" : info.rdma_state) +
+				fmt::format("  wr {}  h{}", info.roce_rx_write_requests,
+					info.roce_out_of_buffer + info.roce_retrans + info.roce_icrc_errors)
+			);
+		}
+
+		int cursor_y = panel.y + 1;
+		for (const auto& line : metadata) {
+			if (cursor_y >= panel.y + panel.height) break;
+			clear_line(out, cursor_y, panel.x, panel.width);
+			out += Mv::to(cursor_y++, panel.x) + Theme::c("main_fg") + uresize(line, panel.width);
+		}
+
+		const int graph_height = panel.y + panel.height - cursor_y;
+		if (graph_height < 4) {
+			if (cursor_y < panel.y + panel.height) {
+				const auto rx = floating_humanizer(info.stat.at("download").speed, false, 0, true, true);
+				const auto tx = floating_humanizer(info.stat.at("upload").speed, false, 0, true, true);
+				clear_line(out, cursor_y, panel.x, panel.width);
+				out += Mv::to(cursor_y, panel.x) + Theme::c("main_fg") +
+					uresize("▼ " + rx + "  ▲ " + tx, panel.width);
+			}
+			return;
+		}
+
+		const string top_dir = swap_upload_download ? "upload" : "download";
+		const array<string, 2> directions = {top_dir, top_dir == "download" ? "upload" : "download"};
+		const int top_height = (graph_height + 1) / 2;
+		const array<int, 2> heights = {top_height, graph_height - top_height};
+
+		for (size_t index = 0; index < directions.size(); ++index) {
+			const auto& dir = directions[index];
+			const int graph_y = cursor_y + (index == 0 ? 0 : heights[0]);
+			const int graph_h = heights[index];
+			const string key = iface + '\x1f' + dir;
+			const auto maximum = net_auto
+				? iface_scales[iface].maximum[dir]
+				: ((static_cast<long long>(Config::getI(dir == "download" ? "net_download" : "net_upload")) << 20) / 8);
+
+			if (redraw or not graphs.contains(key)) {
+				graphs[key] = Draw::Graph{
+					panel.width, graph_h, dir, info.bandwidth.at(dir), graph_symbol,
+					index == 1, true, static_cast<long long>(maximum)
+				};
+			}
+			out += Mv::to(graph_y, panel.x) +
+				graphs.at(key)(info.bandwidth.at(dir), redraw or data_same or not info.connected);
+
+			const auto& stat = info.stat.at(dir);
+			const string symbol = dir == "upload" ? "▲" : "▼";
+			string current = symbol + " " + floating_humanizer(stat.speed, false, 0, false, true);
+			if (panel.width >= 30)
+				current += " (" + floating_humanizer(stat.speed, false, 0, true, true) + ")";
+			out += Mv::to(graph_y, panel.x) + Fx::ub + Theme::c("graph_text") +
+				uresize(current, panel.width);
+
+			if (graph_h >= 2) {
+				const string summary =
+					"top " + floating_humanizer(stat.top, false, 0, true, true) +
+					"  total " + floating_humanizer(stat.total);
+				out += Mv::to(graph_y + 1, panel.x) + Theme::c("graph_text") +
+					uresize(summary, panel.width);
+			}
+		}
+	}
+
+	string draw_multi(const vector<string>& ifaces, const bool force_redraw, const bool data_same) {
+		if (Runner::stopping) return "";
+		if (force_redraw) redraw = true;
+		const bool net_auto = Config::getB("net_auto");
+		const bool net_sync = Config::getB("net_sync");
+		const bool iface_sync = Config::getB("net_iface_sync");
+		const bool tty_mode = Config::getB("tty_mode");
+		const bool swap_upload_download = Config::getB("swap_upload_download");
+		const auto& graph_symbol = tty_mode ? "tty" : Config::getS("graph_symbol_net");
+
+		if (update_iface_scales(ifaces, force_redraw, net_auto, net_sync, iface_sync)) redraw = true;
+
+		vector<const net_info*> physical_health;
+		vector<string> physical_ids;
+		for (const auto& iface : ifaces) {
+			if (not current_net.contains(iface)) continue;
+			const auto& info = current_net.at(iface);
+			if (info.physical_id.empty() or v_contains(physical_ids, info.physical_id)) continue;
+			physical_ids.push_back(info.physical_id);
+			physical_health.push_back(&info);
+		}
+		const int health_rows = min(static_cast<int>(physical_health.size()), max(0, height / 4));
+
+		string out;
+		out.reserve(width * height * 2);
+		if (redraw) {
+			out = box;
+			graphs.clear();
+			const string title_left = Theme::c("net_box") + Fx::ub + Symbols::title_left;
+			const string title_right = Theme::c("net_box") + Fx::ub + Symbols::title_right;
+			int button_x = x + 8;
+			auto add_button = [&](const string& key, const string& label, const bool active) {
+				if (button_x + static_cast<int>(label.size()) + 4 >= x + width) return;
+				out += Mv::to(y, button_x) + title_left + (active ? Fx::b : "") +
+					Theme::c("hi_fg") + key + Theme::c("title") + label + Fx::ub + title_right;
+				Input::mouse_mappings[key] = {y, button_x + 1, 1, static_cast<int>(label.size()) + 1};
+				button_x += static_cast<int>(label.size()) + 4;
+			};
+			add_button("a", "uto", net_auto);
+			add_button("y", "sync", net_sync);
+			add_button("v", "shared", iface_sync);
+			add_button("z", "ero", false);
+		}
+
+		const auto panels = panel_layout(ifaces.size(), health_rows, out, redraw);
+		for (size_t index = 0; index < ifaces.size() and index < panels.size(); ++index)
+			draw_panel(out, ifaces[index], panels[index], swap_upload_download, net_auto, graph_symbol, data_same);
+
+		const int health_y = y + height - health_rows;
+		for (int index = 0; index < health_rows; ++index) {
+			const auto& info = *physical_health.at(index);
+			const auto& health = info.phy_health;
+			const string label = info.physical_port.empty() ? "link" : info.physical_port;
+			string line = label + " PHY";
+			if (not health.fec_mode.empty()) line += "  FEC " + health.fec_mode;
+			line += fmt::format(
+				"  corr {}/s  err {}  down {}  pause {}/{}",
+				health.corrected_bits_per_second,
+				health.crc_errors + health.symbol_errors,
+				health.link_down_events,
+				health.rx_pause,
+				health.tx_pause
+			);
+			if (width >= 100 and not health.firmware.empty()) line += "  fw " + health.firmware;
+			clear_line(out, health_y + index, x + 1, width - 2);
+			out += Mv::to(health_y + index, x + 1) + Theme::c("main_fg") + uresize(line, width - 2);
+		}
+
+		redraw = false;
+		return out + Fx::reset;
+	}
+
+	string draw(const net_info& net, bool force_redraw, bool data_same) {
+		const auto ifaces = displayed_interfaces();
+		if (ifaces.size() > 1) return draw_multi(ifaces, force_redraw, data_same);
+		return draw_single(net, force_redraw, data_same);
 	}
 
 }
@@ -2522,11 +2858,6 @@ namespace Draw {
 			u_graph_height = height - 2 - d_graph_height;
 
 			box = createBox(x, y, width, height, Theme::c("net_box"), true, "net", "", 3);
-			auto swap_up_down = Config::getB("swap_upload_download");
-			if (swap_up_down)
-				box += createBox(b_x, b_y, b_width, b_height, "", false, "upload", "download");
-			else
-				box += createBox(b_x, b_y, b_width, b_height, "", false, "download", "upload");
 		}
 
 		//* Calculate and draw proc box outlines
