@@ -17,6 +17,7 @@ tab-size = 4
 */
 
 #include <algorithm>
+#include <cmath>
 #include <sys/resource.h>
 #include <filesystem>
 #include <fstream>
@@ -134,6 +135,30 @@ namespace Net {
 				scale.upload = upload;
 			}
 		}
+	}
+
+	void update_net_stat(net_stat& stat, const uint64_t value, const uint64_t elapsed_ms) {
+		if (not stat.initialized) {
+			stat.last = value;
+			stat.total = value;
+			stat.initialized = true;
+			return;
+		}
+
+		if (value < stat.last) {
+			stat.rollover += stat.last;
+			stat.last = value;
+			stat.speed = 0;
+			stat.total = stat.rollover + value;
+			return;
+		}
+
+		stat.speed = elapsed_ms == 0
+			? 0
+			: static_cast<uint64_t>(std::round(static_cast<double>(value - stat.last) * 1000.0 / elapsed_ms));
+		stat.top = std::max(stat.top, stat.speed);
+		stat.total = stat.rollover + value;
+		stat.last = value;
 	}
 
 	string physical_interface_id(

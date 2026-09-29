@@ -2900,6 +2900,7 @@ namespace Net {
 			string physical_id;
 			string physical_port;
 			string rdma_device;
+			string rdma_port_path;
 			string rdma_state;
 			string rdma_physical_state;
 			string rdma_rate;
@@ -2912,11 +2913,28 @@ namespace Net {
 			net_phy_health phy_health{};
 		};
 
+		struct ethtool_stats_layout {
+			uint32_t count{};
+			std::optional<uint32_t> rx_bytes_phy;
+			std::optional<uint32_t> tx_bytes_phy;
+			bool initialized{};
+		};
+
 		uint64_t read_u64(const fs::path& path) {
 			const auto value = readfile(path, "0");
 			uint64_t parsed{};
 			const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
 			return result.ec == std::errc{} ? parsed : 0;
+		}
+
+		std::optional<uint64_t> read_u64_optional(const fs::path& path) {
+			std::error_code ec;
+			if (not fs::exists(path, ec) or ec) return std::nullopt;
+			const auto value = readfile(path);
+			uint64_t parsed{};
+			const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+			if (result.ec != std::errc{}) return std::nullopt;
+			return parsed;
 		}
 
 		string pci_address(const string& iface) {
@@ -2932,6 +2950,136 @@ namespace Net {
 				if (it->is_directory(ec) or it->is_symlink(ec)) return it->path().filename();
 			}
 			return "";
+		}
+
+		fs::path rdma_port_path(const fs::path& net_path, const string& rdma_device, const string& iface) {
+			const fs::path ports = fs::path{"/sys/class/infiniband"} / rdma_device / "ports";
+			std::error_code ec;
+			const auto end = fs::directory_iterator{};
+			for (auto port = fs::directory_iterator(ports, ec); not ec and port != end; port.increment(ec)) {
+				std::error_code mapping_ec;
+				const auto mappings = port->path() / "gid_attrs/ndevs";
+				for (
+					auto mapping = fs::directory_iterator(mappings, mapping_ec);
+					not mapping_ec and mapping != end;
+					mapping.increment(mapping_ec)
+				) {
+					if (readfile(mapping->path()) == iface) return port->path();
+				}
+			}
+
+			ec.clear();
+			if (fs::exists(net_path / "dev_port", ec)) {
+				const auto candidate = ports / to_string(read_u64(net_path / "dev_port") + 1);
+				ec.clear();
+				if (fs::is_directory(candidate, ec)) return candidate;
+			}
+
+			const auto first = first_directory_name(ports);
+			return first.empty() ? fs::path{} : ports / first;
+		}
+
+		void update_traffic(
+			net_traffic& traffic,
+			const string& direction,
+			const uint64_t value,
+			const uint64_t elapsed_ms
+		) {
+			traffic.available = true;
+			auto& stat = traffic.stat.at(direction);
+			update_net_stat(stat, value, elapsed_ms);
+			auto& bandwidth = traffic.bandwidth.at(direction);
+			bandwidth.push_back(stat.speed);
+			while (cmp_greater(bandwidth.size(), max(2, width * 2))) bandwidth.pop_front();
+		}
+
+		std::optional<pair<uint64_t, uint64_t>> collect_physical_bytes(const string& iface) {
+			static std::unordered_map<string, ethtool_stats_layout> layouts;
+			auto& layout = layouts[iface];
+			const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+			if (fd < 0) return std::nullopt;
+
+			struct ifreq request {};
+			std::strncpy(request.ifr_name, iface.c_str(), IFNAMSIZ - 1);
+			auto run = [&](void* data) {
+				request.ifr_data = static_cast<char*>(data);
+				return ioctl(fd, SIOCETHTOOL, &request) == 0;
+			};
+
+			if (not layout.initialized) {
+				struct ethtool_drvinfo driver {};
+				driver.cmd = ETHTOOL_GDRVINFO;
+				if (not run(&driver) or driver.n_stats == 0) {
+					close(fd);
+					layout.initialized = true;
+					return std::nullopt;
+				}
+
+				vector<unsigned char> strings_buffer(
+					sizeof(struct ethtool_gstrings) + driver.n_stats * ETH_GSTRING_LEN
+				);
+				auto* strings = reinterpret_cast<struct ethtool_gstrings*>(strings_buffer.data());
+				strings->cmd = ETHTOOL_GSTRINGS;
+				strings->string_set = ETH_SS_STATS;
+				strings->len = driver.n_stats;
+				if (not run(strings)) {
+					close(fd);
+					return std::nullopt;
+				}
+
+				layout.count = driver.n_stats;
+				for (uint32_t i = 0; i < driver.n_stats; ++i) {
+					const auto* raw_name = reinterpret_cast<const char*>(strings->data + i * ETH_GSTRING_LEN);
+					const string name{raw_name, strnlen(raw_name, ETH_GSTRING_LEN)};
+					if (name == "rx_bytes_phy") layout.rx_bytes_phy = i;
+					else if (name == "tx_bytes_phy") layout.tx_bytes_phy = i;
+				}
+				layout.initialized = true;
+			}
+
+			if (not layout.rx_bytes_phy or not layout.tx_bytes_phy) {
+				close(fd);
+				return std::nullopt;
+			}
+
+			vector<unsigned char> stats_buffer(
+				sizeof(struct ethtool_stats) + layout.count * sizeof(uint64_t)
+			);
+			auto* stats = reinterpret_cast<struct ethtool_stats*>(stats_buffer.data());
+			stats->cmd = ETHTOOL_GSTATS;
+			stats->n_stats = layout.count;
+			if (not run(stats)) {
+				layout = {};
+				close(fd);
+				return std::nullopt;
+			}
+
+			const pair result{stats->data[*layout.rx_bytes_phy], stats->data[*layout.tx_bytes_phy]};
+			close(fd);
+			return result;
+		}
+
+		void collect_rdma_traffic(net_info& info, const uint64_t elapsed_ms) {
+			if (info.rdma_port_path.empty()) return;
+			const fs::path counters = fs::path{info.rdma_port_path} / "counters";
+			const auto receive_words = read_u64_optional(counters / "port_rcv_data");
+			const auto transmit_words = read_u64_optional(counters / "port_xmit_data");
+			if (not receive_words or not transmit_words) return;
+
+			const auto to_bytes = [](const uint64_t words) {
+				return words > numeric_limits<uint64_t>::max() / 4
+					? numeric_limits<uint64_t>::max()
+					: words * 4;
+			};
+			update_traffic(info.rdma_traffic, "download", to_bytes(*receive_words), elapsed_ms);
+			update_traffic(info.rdma_traffic, "upload", to_bytes(*transmit_words), elapsed_ms);
+		}
+
+		void collect_physical_traffic(net_info& info, const string& iface, const uint64_t elapsed_ms) {
+			const auto counters = collect_physical_bytes(iface);
+			if (not counters) return;
+			update_traffic(info.physical_traffic, "download", counters->first, elapsed_ms);
+			update_traffic(info.physical_traffic, "upload", counters->second, elapsed_ms);
 		}
 
 		string state_name(string value) {
@@ -3036,7 +3184,13 @@ namespace Net {
 			snapshot.rdma_device = first_directory_name(net_path / "device/infiniband");
 
 			if (not snapshot.rdma_device.empty()) {
-				const fs::path rdma_port = fs::path{"/sys/class/infiniband"} / snapshot.rdma_device / "ports/1";
+				const fs::path rdma_port = rdma_port_path(net_path, snapshot.rdma_device, iface);
+				snapshot.rdma_port_path = rdma_port;
+				if (rdma_port.empty()) {
+					collect_ethtool_health(snapshot);
+					snapshot.phy_health.updated_ms = time_ms();
+					return snapshot;
+				}
 				snapshot.rdma_state = state_name(readfile(rdma_port / "state"));
 				snapshot.rdma_physical_state = state_name(readfile(rdma_port / "phys_state"));
 				snapshot.rdma_rate = readfile(rdma_port / "rate");
@@ -3077,6 +3231,11 @@ namespace Net {
 				info.pci_address,
 				iface
 			);
+
+			if (info.rdma_device.empty())
+				info.rdma_device = first_directory_name(net_path / "device/infiniband");
+			if (info.rdma_port_path.empty() and not info.rdma_device.empty())
+				info.rdma_port_path = rdma_port_path(net_path, info.rdma_device, iface);
 		}
 
 		void apply_slow_snapshot(net_info& info, slow_net_snapshot snapshot) {
@@ -3095,6 +3254,7 @@ namespace Net {
 			info.physical_id = std::move(snapshot.physical_id);
 			info.physical_port = std::move(snapshot.physical_port);
 			info.rdma_device = std::move(snapshot.rdma_device);
+			info.rdma_port_path = std::move(snapshot.rdma_port_path);
 			info.rdma_state = std::move(snapshot.rdma_state);
 			info.rdma_physical_state = std::move(snapshot.rdma_physical_state);
 			info.rdma_rate = std::move(snapshot.rdma_rate);
@@ -3162,6 +3322,9 @@ namespace Net {
 		auto net_sync = Config::getB("net_sync");
 		auto net_auto = Config::getB("net_auto");
 		auto new_timestamp = time_ms();
+		const uint64_t sample_interval_ms = timestamp > 0 and new_timestamp > timestamp
+			? new_timestamp - timestamp
+			: 0;
 
 		if (not no_update and errors < 3) {
 			//? Get interface list using getifaddrs() wrapper
@@ -3322,6 +3485,17 @@ namespace Net {
 		if (detail_ifaces.empty() and not selected_iface.empty()) detail_ifaces.push_back(selected_iface);
 		for (const auto& iface : detail_ifaces) {
 			if (net.contains(iface)) collect_fast_details(net.at(iface), iface);
+		}
+		if (not no_update) {
+			std::unordered_set<string> sampled_physical_ports;
+			for (const auto& iface : detail_ifaces) {
+				if (not net.contains(iface)) continue;
+				auto& info = net.at(iface);
+				collect_rdma_traffic(info, sample_interval_ms);
+				const auto& physical_id = info.physical_id.empty() ? iface : info.physical_id;
+				if (sampled_physical_ports.insert(physical_id).second)
+					collect_physical_traffic(info, iface, sample_interval_ms);
+			}
 		}
 		if (not no_update) update_slow_health(net, detail_ifaces, new_timestamp);
 

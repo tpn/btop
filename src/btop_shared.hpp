@@ -325,6 +325,13 @@ namespace Net {
 		uint64_t last{};
 		uint64_t offset{};
 		uint64_t rollover{};
+		bool initialized{};
+	};
+
+	struct net_traffic {
+		std::unordered_map<string, deque<long long>> bandwidth = { {"download", {}}, {"upload", {}} };
+		std::unordered_map<string, net_stat> stat = { {"download", {}}, {"upload", {}} };
+		bool available{};
 	};
 
 	struct net_phy_health {
@@ -356,6 +363,7 @@ namespace Net {
 		string physical_id{};
 		string physical_port{};
 		string rdma_device{};
+		string rdma_port_path{};
 		string rdma_state{};
 		string rdma_physical_state{};
 		string rdma_rate{};
@@ -371,6 +379,8 @@ namespace Net {
 		uint64_t roce_cnp{};
 		uint64_t roce_icrc_errors{};
 		uint64_t roce_rx_write_requests{};
+		net_traffic rdma_traffic{};
+		net_traffic physical_traffic{};
 		net_phy_health phy_health{};
 		bool carrier{};
 		bool connected{};
@@ -387,6 +397,9 @@ namespace Net {
 
 	//* Apply optional direction and cross-interface scale synchronization in place.
 	void synchronize_graph_scales(vector<net_graph_scale>& scales, bool sync_directions, bool sync_interfaces);
+
+	//* Update a monotonically increasing byte counter without producing startup or reset spikes.
+	void update_net_stat(net_stat& stat, uint64_t value, uint64_t elapsed_ms);
 
 	//* Build a stable physical-port key, falling back to the PCI address or interface name.
 	string physical_interface_id(

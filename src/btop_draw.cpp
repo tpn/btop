@@ -1625,6 +1625,20 @@ namespace Net {
 		return to_string(speed_mbps) + "M";
 	}
 
+	uint64_t link_capacity_bytes(const net_info& info, const net_traffic& traffic) {
+		if (info.link_speed_mbps > 0) return info.link_speed_mbps * 125'000;
+		return max(
+			static_cast<uint64_t>(10 << 10),
+			max(traffic.stat.at("download").top, traffic.stat.at("upload").top)
+		);
+	}
+
+	double link_utilization(const uint64_t bytes_per_second, const uint64_t link_speed_mbps) {
+		if (link_speed_mbps == 0) return 0.0;
+		return static_cast<double>(bytes_per_second) * 8.0 * 100.0 /
+			(static_cast<double>(link_speed_mbps) * 1'000'000.0);
+	}
+
 	bool update_iface_scales(
 		const vector<string>& ifaces,
 		const bool force,
@@ -1776,6 +1790,16 @@ namespace Net {
 		const string state = info.carrier ? "UP " + link_speed(info.link_speed_mbps) : "DOWN";
 		out += Mv::to(panel.y, panel.x + max(0, panel.width - static_cast<int>(state.size()))) +
 			(info.carrier ? Theme::g("available").at(100) : Theme::c("inactive_fg")) + state;
+		if (panel.height < 8 and info.rdma_traffic.available) {
+			const string rates = "R▼" + floating_humanizer(
+				info.rdma_traffic.stat.at("download").speed, true, 0, true, true
+			) + " ▲" + floating_humanizer(
+				info.rdma_traffic.stat.at("upload").speed, true, 0, true, true
+			);
+			const int rates_x = panel.x + static_cast<int>(iface.size()) + 1;
+			if (rates_x + static_cast<int>(rates.size()) < panel.x + panel.width - static_cast<int>(state.size()))
+				out += Mv::to(panel.y, rates_x) + Theme::c("main_fg") + rates;
+		}
 
 		vector<string> metadata;
 		const string address = not info.ipv4.empty() ? info.ipv4 : info.ipv6;
@@ -1789,11 +1813,19 @@ namespace Net {
 			);
 		}
 		if (panel.height >= 8 and not info.rdma_device.empty()) {
-			metadata.push_back(
-				"RoCE " + info.rdma_device + " " + (info.rdma_state.empty() ? "?" : info.rdma_state) +
-				fmt::format("  wr {}  h{}", info.roce_rx_write_requests,
-					info.roce_out_of_buffer + info.roce_retrans + info.roce_icrc_errors)
-			);
+			string line = "RoCE " + info.rdma_device + " " + (info.rdma_state.empty() ? "?" : info.rdma_state);
+			if (info.rdma_traffic.available) {
+				line += "  ▼" + floating_humanizer(
+					info.rdma_traffic.stat.at("download").speed, true, 0, true, true
+				) + " ▲" + floating_humanizer(
+					info.rdma_traffic.stat.at("upload").speed, true, 0, true, true
+				);
+			}
+			if (panel.width >= 64) {
+				line += fmt::format("  wr {}  h{}", info.roce_rx_write_requests,
+					info.roce_out_of_buffer + info.roce_retrans + info.roce_icrc_errors);
+			}
+			metadata.push_back(std::move(line));
 		}
 
 		int cursor_y = panel.y + 1;
@@ -1803,7 +1835,33 @@ namespace Net {
 			out += Mv::to(cursor_y++, panel.x) + Theme::c("main_fg") + uresize(line, panel.width);
 		}
 
-		const int graph_height = panel.y + panel.height - cursor_y;
+		int graph_height = panel.y + panel.height - cursor_y;
+		if (info.rdma_traffic.available and graph_height >= 6) {
+			const string top_dir = swap_upload_download ? "upload" : "download";
+			const array<string, 2> directions = {top_dir, top_dir == "download" ? "upload" : "download"};
+			const auto maximum = link_capacity_bytes(info, info.rdma_traffic);
+			for (const auto& dir : directions) {
+				const string key = iface + '\x1f' + "rdma-" + dir;
+				const auto& bandwidth = info.rdma_traffic.bandwidth.at(dir);
+				if (redraw or not graphs.contains(key)) {
+					graphs[key] = Draw::Graph{
+						panel.width, 1, dir, bandwidth, graph_symbol,
+						false, true, static_cast<long long>(maximum)
+					};
+				}
+				clear_line(out, cursor_y, panel.x, panel.width);
+				out += Mv::to(cursor_y, panel.x) +
+					graphs.at(key)(bandwidth, redraw or data_same or not info.connected);
+				const auto speed = info.rdma_traffic.stat.at(dir).speed;
+				string current = "RDMA " + string(dir == "upload" ? "▲" : "▼") + " " +
+					floating_humanizer(speed, false, 0, true, true);
+				if (panel.width >= 30)
+					current += fmt::format("  {:.0f}%", link_utilization(speed, info.link_speed_mbps));
+				out += Mv::to(cursor_y++, panel.x) + Fx::ub + Theme::c("graph_text") +
+					uresize(current, panel.width);
+			}
+			graph_height -= 2;
+		}
 		if (graph_height < 4) {
 			if (cursor_y < panel.y + panel.height) {
 				const auto rx = floating_humanizer(info.stat.at("download").speed, false, 0, true, true);
@@ -1910,6 +1968,19 @@ namespace Net {
 			const auto& health = info.phy_health;
 			const string label = info.physical_port.empty() ? "link" : info.physical_port;
 			string line = label + " PHY";
+			if (info.physical_traffic.available) {
+				const auto receive = info.physical_traffic.stat.at("download").speed;
+				const auto transmit = info.physical_traffic.stat.at("upload").speed;
+				line += "  wire ▼" + floating_humanizer(receive, false, 0, true, true) +
+					" ▲" + floating_humanizer(transmit, false, 0, true, true);
+				if (info.link_speed_mbps > 0) {
+					line += fmt::format(
+						" {:.0f}%",
+						max(link_utilization(receive, info.link_speed_mbps),
+							link_utilization(transmit, info.link_speed_mbps))
+					);
+				}
+			}
 			if (not health.fec_mode.empty()) line += "  FEC " + health.fec_mode;
 			line += fmt::format(
 				"  corr {}/s  err {}  down {}  pause {}/{}",

@@ -242,8 +242,9 @@ namespace Config {
 
 		{"net_iface_sync",		"#* Sync the graph scaling across all interfaces listed in net_iface."},
 
-		{"net_iface", 			"#* Network interface or ordered whitespace-separated list of interfaces to show.\n"
-								"#* A single interface keeps the classic view; two or more interfaces enable equal multi-interface panels."},
+			{"net_iface", 			"#* Network interface or ordered whitespace-separated list of interfaces to show.\n"
+									"#* A single interface keeps the classic view; two or more interfaces enable equal multi-interface panels.\n"
+									"#* On Linux, available RDMA and physical-port hardware rates are shown separately from netdev traffic."},
 
 	    {"base_10_bitrate",     "#* \"True\" shows bitrates in base 10 (Kbps, Mbps). \"False\" shows bitrates in binary sizes (Kibps, Mibps, etc.). \"Auto\" uses base_10_sizes."},
 
