@@ -75,3 +75,36 @@ TEST(network, graph_scales_can_sync_directions_and_interfaces) {
 		EXPECT_EQ(scale.upload, 200);
 	}
 }
+
+TEST(network, counter_rate_avoids_startup_and_reset_spikes) {
+	Net::net_stat stat;
+
+	Net::update_net_stat(stat, 1'000, 1'000);
+	EXPECT_TRUE(stat.initialized);
+	EXPECT_EQ(stat.speed, 0);
+	EXPECT_EQ(stat.total, 1'000);
+
+	Net::update_net_stat(stat, 2'500, 500);
+	EXPECT_EQ(stat.speed, 3'000);
+	EXPECT_EQ(stat.top, 3'000);
+	EXPECT_EQ(stat.total, 2'500);
+
+	Net::update_net_stat(stat, 100, 1'000);
+	EXPECT_EQ(stat.speed, 0);
+	EXPECT_EQ(stat.total, 2'600);
+
+	Net::update_net_stat(stat, 600, 1'000);
+	EXPECT_EQ(stat.speed, 500);
+	EXPECT_EQ(stat.top, 3'000);
+	EXPECT_EQ(stat.total, 3'100);
+}
+
+TEST(network, counter_rate_handles_zero_elapsed_time) {
+	Net::net_stat stat;
+	Net::update_net_stat(stat, 100, 1'000);
+	Net::update_net_stat(stat, 200, 0);
+
+	EXPECT_EQ(stat.speed, 0);
+	EXPECT_EQ(stat.last, 200);
+	EXPECT_EQ(stat.total, 200);
+}
